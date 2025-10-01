@@ -7,9 +7,9 @@ extern crate gdbm_sys;
 extern crate libc;
 
 use std::error::Error as StdError;
-use std::io::Error;
-use std::fmt;
 use std::ffi::{CStr, CString, IntoStringError, NulError};
+use std::fmt;
+use std::io::Error;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
@@ -104,7 +104,6 @@ impl From<Error> for GdbmError {
     }
 }
 
-
 fn get_error() -> String {
     unsafe {
         let error_ptr = gdbm_strerror(*gdbm_errno_location());
@@ -154,6 +153,49 @@ bitflags! {
     }
 }
 
+/// An iterator over the keys in a `gdbm` database.
+pub struct GdbmIterator {
+    db_handle: GDBM_FILE,
+    current_key: Option<datum>,
+}
+
+impl Iterator for GdbmIterator {
+    type Item = Result<String, GdbmError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let content = if let Some(current_key) = self.current_key {
+            let next_key = unsafe { gdbm_nextkey(self.db_handle, current_key) };
+            unsafe { free(self.current_key.unwrap().dptr as *mut c_void) };
+            next_key
+        } else {
+            unsafe { gdbm_firstkey(self.db_handle) }
+        };
+
+        if content.dptr.is_null() {
+            self.current_key = None;
+            return None;
+        }
+
+        self.current_key = Some(content);
+
+        let c_string = unsafe { CStr::from_ptr(content.dptr) };
+        match c_string.to_str() {
+            Ok(data) => Some(Ok(data.to_string())),
+            Err(e) => Some(Err(GdbmError::new(e.to_string()))),
+        }
+    }
+}
+
+impl Drop for GdbmIterator {
+    fn drop(&mut self) {
+        if let Some(current_key) = self.current_key {
+            if !current_key.dptr.is_null() {
+                unsafe { free(current_key.dptr as *mut c_void) };
+            }
+        }
+    }
+}
+
 /// An open `gdbm` database.
 ///
 /// Note that a lot of the methods take arguments of type `impl AsRef<[u8]>`.
@@ -192,9 +234,7 @@ impl Drop for Gdbm {
 /// writers operating on the same file simultaneously.
 impl AsRawFd for Gdbm {
     fn as_raw_fd(&self) -> RawFd {
-        unsafe {
-            gdbm_fdesc(self.db_handle) as RawFd
-        }
+        unsafe { gdbm_fdesc(self.db_handle) as RawFd }
     }
 }
 
@@ -208,7 +248,7 @@ impl Gdbm {
         path: impl AsRef<Path>,
         block_size: u32,
         flags: Open,
-        mode: u32
+        mode: u32,
     ) -> Result<Gdbm, GdbmError> {
         if block_size > i32::MAX as u32 {
             return Err(GdbmError::new("block_size too large"));
@@ -218,11 +258,13 @@ impl Gdbm {
         }
         let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
         unsafe {
-            let db_ptr = gdbm_open(path.as_ptr() as *mut i8,
-                                   block_size as i32,
-                                   flags.bits as i32,
-                                   mode as i32,
-                                   None);
+            let db_ptr = gdbm_open(
+                path.as_ptr() as *mut i8,
+                block_size as i32,
+                flags.bits as i32,
+                mode as i32,
+                None,
+            );
             if db_ptr.is_null() {
                 return Err(GdbmError::new("gdbm_open failed".to_string()));
             }
@@ -243,10 +285,13 @@ impl Gdbm {
     ) -> Result<bool, GdbmError> {
         let key_datum = datum("key", key)?;
         let content_datum = datum("content", content)?;
-        let flag = if replace { Store::REPLACE } else { Store::INSERT };
-        let result = unsafe {
-            gdbm_store(self.db_handle, key_datum, content_datum, flag.bits as i32)
+        let flag = if replace {
+            Store::REPLACE
+        } else {
+            Store::INSERT
         };
+        let result =
+            unsafe { gdbm_store(self.db_handle, key_datum, content_datum, flag.bits as i32) };
         if result < 0 {
             return Err(GdbmError::new(get_error()));
         }
@@ -307,9 +352,7 @@ impl Gdbm {
     /// was present and the record was deleted.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool, GdbmError> {
         let key_datum = datum("key", key)?;
-        let result = unsafe {
-            gdbm_delete(self.db_handle, key_datum)
-        };
+        let result = unsafe { gdbm_delete(self.db_handle, key_datum) };
         if result < 0 {
             if unsafe { *gdbm_errno_location() } == 0 {
                 return Ok(false);
@@ -319,30 +362,14 @@ impl Gdbm {
         Ok(true)
     }
 
-    // TODO: Make an iterator out of this to hide the datum handling
-    // pub fn firstkey(&self, key: &str) -> Result<String, GdbmError> {
-    // unsafe {
-    // let content = gdbm_firstkey(self.db_handle);
-    // if content.dptr.is_null() {
-    // return Err(GdbmError::new(get_error()));
-    // } else {
-    // let c_string = CStr::from_ptr(content.dptr);
-    // let data = c_string.to_str()?.to_string();
-    // Free the malloc'd content that the library gave us
-    // Rust will manage this memory
-    // free(content.dptr as *mut c_void);
-    //
-    // return Ok(data);
-    // }
-    // }
-    // }
-    // pub fn nextkey(&self, key: &str) -> Result<String, GdbmError> {
-    // unsafe {
-    // datum gdbm_nextkey(dbf, key);
-    //
-    // }
-    // }
-    //
+    /// Return an iterator over all keys in the database.
+    pub fn iter(&self) -> GdbmIterator {
+        GdbmIterator {
+            db_handle: self.db_handle,
+            current_key: None,
+        }
+    }
+
     // int gdbm_reorganize(dbf);
     pub fn sync(&self) {
         unsafe {
